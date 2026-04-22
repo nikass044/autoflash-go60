@@ -79,8 +79,13 @@ for f in "$@"; do
         ATTEMPT=1
         COPIED=0
         while [[ $ATTEMPT -le 5 ]]; do
+          if [[ ! -d "$f" ]]; then
+            log "ABORT: Volume detached before attempt $ATTEMPT: $f"
+            break
+          fi
+
           log "Copy attempt $ATTEMPT: cp '$UF2_PATH' '$DEST_PATH'"
-          if /bin/cp -f -v "$UF2_PATH" "$DEST_PATH" >> "$LOG" 2>&1; then
+          if /bin/cp -X -f -v "$UF2_PATH" "$DEST_PATH" >> "$LOG" 2>&1; then
             SRC_SIZE=$(/usr/bin/stat -f "%z" "$UF2_PATH" 2>/dev/null)
             DST_SIZE=$(/usr/bin/stat -f "%z" "$DEST_PATH" 2>/dev/null)
             log "SUCCESS: Copied $UF2_NAME to $VOLUME_NAME (src=$SRC_SIZE bytes, dst=$DST_SIZE bytes)"
@@ -88,6 +93,12 @@ for f in "$@"; do
             break
           fi
           log "Copy attempt $ATTEMPT failed"
+
+          if [[ ! -d "$f" ]]; then
+            log "ABORT: Volume detached after failed attempt $ATTEMPT: $f"
+            break
+          fi
+
           /bin/sleep 0.5
           ATTEMPT=$((ATTEMPT + 1))
         done

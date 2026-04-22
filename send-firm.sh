@@ -2,115 +2,156 @@
 
 FIRMWARE_DIR="$HOME/Downloads"
 LOG="/tmp/flash-uf2.log"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UF2_FINDER="$SCRIPT_DIR/latest-uf2.py"
+MAX_COPY_ATTEMPTS=5
+COPY_RETRY_DELAY=0.5
 
 log() {
-    echo "$(date): $1" >> "$LOG"
+  echo "$(date): $1" >> "$LOG"
+}
+
+is_target_volume() {
+  local volume_name="$1"
+  case "$volume_name" in
+    GO60RHBOOT*|GO60LHBOOT*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 latest_uf2() {
-  /usr/bin/python3 - "$FIRMWARE_DIR" <<'PY'
-import os, sys, glob
-
-d = sys.argv[1]
-if not os.path.isdir(d):
-    print(f"Firmware directory not found: {d}", file=sys.stderr)
-    sys.exit(2)
-
-paths = [
-    p for p in glob.glob(os.path.join(d, "*"))
-    if os.path.isfile(p) and p.lower().endswith(".uf2")
-]
-if not paths:
-    sys.exit(1)
-
-def ts(p):
-    st = os.stat(p)
-    bt = getattr(st, "st_birthtime", None)
-    return bt if bt is not None else st.st_mtime
-
-paths.sort(key=ts, reverse=True)
-print(paths[0])
-PY
+  /usr/bin/python3 "$UF2_FINDER" "$FIRMWARE_DIR"
 }
 
-for f in "$@"; do
-    VOLUME_NAME=$(basename "$f")
-    log "Raw argument: '$f'"
-    log "Volume mounted: $VOLUME_NAME"
-    log "Mount path: $f"
+log_latest_uf2_failure() {
+  local status="$1"
+  if [[ "$status" -eq 2 ]]; then
+    log "FAILED: Firmware directory not found: $FIRMWARE_DIR"
+  elif [[ "$status" -eq 1 ]]; then
+    log "FAILED: No .uf2 files found in $FIRMWARE_DIR"
+  elif [[ "$status" -eq 64 ]]; then
+    log "FAILED: UF2 helper usage error: $UF2_FINDER"
+  else
+    log "FAILED: latest_uf2 exited with status $status (dir: $FIRMWARE_DIR helper: $UF2_FINDER)"
+  fi
+}
 
-    case "$VOLUME_NAME" in
-      GO60RHBOOT*|GO60LHBOOT*)
-        UF2_PATH="$(latest_uf2 2>>"$LOG")"
-        UF2_STATUS=$?
-        if [[ $UF2_STATUS -ne 0 || -z "$UF2_PATH" ]]; then
-          if [[ $UF2_STATUS -eq 2 ]]; then
-            log "FAILED: Firmware directory not found: $FIRMWARE_DIR"
-          elif [[ $UF2_STATUS -eq 1 ]]; then
-            log "FAILED: No .uf2 files found in $FIRMWARE_DIR"
-          else
-            log "FAILED: latest_uf2 exited with status $UF2_STATUS (dir: $FIRMWARE_DIR)"
-          fi
-          exit 1
-        fi
+volume_exists() {
+  local mount_path="$1"
+  [[ -d "$mount_path" ]]
+}
 
-        UF2_NAME="$(basename "$UF2_PATH")"
-        log "Selected newest UF2: $UF2_PATH"
-        if [[ ! -r "$UF2_PATH" ]]; then
-          log "FAILED: UF2 file is not readable: $UF2_PATH"
-          continue
-        fi
+ensure_mount_writable() {
+  local mount_path="$1"
+  local test_file
 
-        log "Copying $UF2_NAME to $VOLUME_NAME..."
-        if [[ ! -d "$f" ]]; then
-          log "FAILED: Mount path is not a directory: $f"
-          continue
-        fi
+  if ! volume_exists "$mount_path"; then
+    log "FAILED: Mount path is not a directory: $mount_path"
+    return 1
+  fi
 
-        /usr/bin/stat -f "Mount stat -> perms:%Sp owner:%Su:%Sg path:%N" "$f" >> "$LOG" 2>&1
-        TEST_FILE="$f/.flash-write-test-$$"
-        if ! /usr/bin/touch "$TEST_FILE" >> "$LOG" 2>&1; then
-          log "FAILED: Mount path is not writable (touch test failed): $f"
-          continue
-        fi
-        /bin/rm -f "$TEST_FILE" >> "$LOG" 2>&1
+  /usr/bin/stat -f "Mount stat -> perms:%Sp owner:%Su:%Sg path:%N" "$mount_path" >> "$LOG" 2>&1
+  test_file="$mount_path/.flash-write-test-$$"
+  if ! /usr/bin/touch "$test_file" >> "$LOG" 2>&1; then
+    log "FAILED: Mount path is not writable (touch test failed): $mount_path"
+    return 1
+  fi
+  /bin/rm -f "$test_file" >> "$LOG" 2>&1
+  return 0
+}
 
-        DEST_PATH="$f/$UF2_NAME"
-        ATTEMPT=1
-        COPIED=0
-        while [[ $ATTEMPT -le 5 ]]; do
-          if [[ ! -d "$f" ]]; then
-            log "ABORT: Volume detached before attempt $ATTEMPT: $f"
-            break
-          fi
+copy_with_retries() {
+  local uf2_path="$1"
+  local mount_path="$2"
+  local uf2_name="$3"
+  local volume_name="$4"
+  local dest_path="$mount_path/$uf2_name"
+  local attempt=1
 
-          log "Copy attempt $ATTEMPT: cp '$UF2_PATH' '$DEST_PATH'"
-          if /bin/cp -X -f -v "$UF2_PATH" "$DEST_PATH" >> "$LOG" 2>&1; then
-            SRC_SIZE=$(/usr/bin/stat -f "%z" "$UF2_PATH" 2>/dev/null)
-            DST_SIZE=$(/usr/bin/stat -f "%z" "$DEST_PATH" 2>/dev/null)
-            log "SUCCESS: Copied $UF2_NAME to $VOLUME_NAME (src=$SRC_SIZE bytes, dst=$DST_SIZE bytes)"
-            COPIED=1
-            break
-          fi
-          log "Copy attempt $ATTEMPT failed"
+  while [[ $attempt -le $MAX_COPY_ATTEMPTS ]]; do
+    if ! volume_exists "$mount_path"; then
+      log "ABORT: Volume detached before attempt $attempt: $mount_path"
+      return 1
+    fi
 
-          if [[ ! -d "$f" ]]; then
-            log "ABORT: Volume detached after failed attempt $ATTEMPT: $f"
-            break
-          fi
+    log "Copy attempt $attempt: cp '$uf2_path' '$dest_path'"
+    if /bin/cp -X -f -v "$uf2_path" "$dest_path" >> "$LOG" 2>&1; then
+      log "SUCCESS: Copied $uf2_name to $volume_name"
+      return 0
+    fi
+    log "Copy attempt $attempt failed"
 
-          /bin/sleep 0.5
-          ATTEMPT=$((ATTEMPT + 1))
-        done
+    if ! volume_exists "$mount_path"; then
+      log "ABORT: Volume detached after failed attempt $attempt: $mount_path"
+      return 1
+    fi
 
-        if [[ $COPIED -eq 1 ]]; then
-          osascript -e "display notification \"Copied $UF2_NAME to $VOLUME_NAME\" with title \"Firmware Flashed\""
-        else
-          log "FAILED: Could not copy $UF2_PATH to $DEST_PATH after 5 attempts"
-        fi
-        ;;
-      *)
-        log "Ignored volume (not a target boot volume): $VOLUME_NAME"
-        ;;
-    esac
-done
+    /bin/sleep "$COPY_RETRY_DELAY"
+    attempt=$((attempt + 1))
+  done
+
+  log "FAILED: Could not copy $uf2_path to $dest_path after $MAX_COPY_ATTEMPTS attempts"
+  return 1
+}
+
+process_volume() {
+  local mount_path="$1"
+  local volume_name
+  local uf2_path
+  local uf2_status
+  local uf2_name
+
+  volume_name=$(basename "$mount_path")
+  log "Volume mounted: $volume_name"
+
+  if ! is_target_volume "$volume_name"; then
+    log "Ignored volume (not a target boot volume): $volume_name"
+    return 0
+  fi
+
+  if [[ ! -f "$UF2_FINDER" ]]; then
+    log "FAILED: UF2 helper script not found: $UF2_FINDER"
+    return 1
+  fi
+
+  uf2_path="$(latest_uf2 2>>"$LOG")"
+  uf2_status=$?
+  if [[ $uf2_status -ne 0 || -z "$uf2_path" ]]; then
+    log_latest_uf2_failure "$uf2_status"
+    return 1
+  fi
+
+  uf2_name="$(basename "$uf2_path")"
+  log "Latest firmware file: $uf2_path"
+
+  if [[ ! -r "$uf2_path" ]]; then
+    log "FAILED: UF2 file is not readable: $uf2_path"
+    return 1
+  fi
+
+  log "Copying $uf2_name to $volume_name..."
+  if ! ensure_mount_writable "$mount_path"; then
+    return 1
+  fi
+
+  if copy_with_retries "$uf2_path" "$mount_path" "$uf2_name" "$volume_name"; then
+    return 0
+  fi
+
+  return 1
+}
+
+main() {
+  local mount_path
+  local exit_code=0
+
+  for mount_path in "$@"; do
+    if ! process_volume "$mount_path"; then
+      exit_code=1
+    fi
+  done
+
+  return $exit_code
+}
+
+main "$@"

@@ -60,6 +60,20 @@ ensure_mount_writable() {
   return 0
 }
 
+delete_old_uf2s() {
+  local keep_path="$1"
+  local f
+  while IFS= read -r -d '' f; do
+    if [[ "$f" != "$keep_path" ]]; then
+      if /bin/rm -f "$f" 2>>"$LOG"; then
+        log "Deleted old firmware: $f"
+      else
+        log "WARNING: Could not delete old firmware: $f"
+      fi
+    fi
+  done < <(find "$FIRMWARE_DIR" -maxdepth 1 -iname "*.uf2" -type f -print0)
+}
+
 copy_with_retries() {
   local uf2_path="$1"
   local mount_path="$2"
@@ -135,6 +149,7 @@ process_volume() {
   fi
 
   if copy_with_retries "$uf2_path" "$mount_path" "$uf2_name" "$volume_name"; then
+    delete_old_uf2s "$uf2_path"
     return 0
   fi
 
